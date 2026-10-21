@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>AudioAudit</title>
+<script src="https://cdn.tailwindcss.com/3.4.17"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/htm@3.1.1/dist/htm.umd.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/lucide@0.383.0/dist/umd/lucide.min.js"></script>
+<style>
+:root{color-scheme:dark;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px);background:#07090d}
+html,body{margin:0;background:#07090d;color:#d7e3ea;font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}
+.glow{box-shadow:0 0 0 1px rgba(34,211,238,.18),0 0 32px -12px rgba(34,211,238,.35)}
+.card{background:linear-gradient(180deg,#0d1218,#0a0e13);border:1px solid #17212b;border-radius:16px}
+button:disabled{opacity:.45;cursor:not-allowed}
+</style></head>
+<body><div id="root"></div>
+<script>
+// ==DSP==
+const db=v=>20*Math.log10(Math.max(v,1e-9));
+function fft(re,im){const n=re.length;for(let i=1,j=0;i<n;i++){let b=n>>1;for(;j&b;b>>=1)j^=b;j^=b;if(i<j){let t=re[i];re[i]=re[j];re[j]=t;t=im[i];im[i]=im[j];im[j]=t;}}
+for(let len=2;len<=n;len<<=1){const a=-2*Math.PI/len,wr=Math.cos(a),wi=Math.sin(a),h=len>>1;for(let i=0;i<n;i+=len){let cr=1,ci=0;for(let k=0;k<h;k++){const u=i+k,v=u+h,xr=re[v]*cr-im[v]*ci,xi=re[v]*ci+im[v]*cr;re[v]=re[u]-xr;im[v]=im[u]-xi;re[u]+=xr;im[u]+=xi;const t=cr*wr-ci*wi;ci=cr*wi+ci*wr;cr=t;}}}}
+function synthDemo(sr){const n=sr*5,x=new Float32Array(n);let ph=0;const segs=[];for(let s=.2;s<4.6;s+=.52)segs.push([s,s+.34]);
+for(let i=0;i<n;i++){const t=i/sr;let a=0;for(const[s,e]of segs)if(t>=s&&t<e){a=Math.sin(Math.PI*(t-s)/(e-s));break;}
+if(a>0){ph+=2*Math.PI*(118+14*Math.sin(2*Math.PI*.9*t))/sr;let v=0;for(let h=1;h<=55;h++)v+=Math.sin(h*ph)/Math.pow(h,.85);x[i]=v*a*.3;}}
+const d=Math.round(sr*.09);for(let i=d;i<n;i++)x[i]+=.5*x[i-d];
+let pk=0;for(let i=0;i<n;i++)pk=Math.max(pk,Math.abs(x[i]));
+for(let i=0;i<n;i++){const t=i/sr;const hum=.012*(Math.sin(2*Math.PI*50*t)+.5*Math.sin(2*Math.PI*100*t)+.3*Math.sin(2*Math.PI*150*t));
+x[i]=Math.max(-1,Math.min(1,(x[i]/pk*.9+hum+(Math.random()-.5)*.012)*1.25));}
+return x;}
+function analyze(x,sr,clipOverride){
+const N=x.length;let peak=0,clip=0;for(let i=0;i<N;i++){const a=Math.abs(x[i]);if(a>peak)peak=a;if(a>=.985)clip++;}
+if(clipOverride!=null)clip=clipOverride;
+const hop=Math.round(sr*.01),fr=[];for(let i=0;i+hop<=N;i+=hop){let s=0;for(let k=i;k<i+hop;k++)s+=x[k]*x[k];fr.push(db(Math.sqrt(s/hop)));}
+const so=[...fr].sort((a,b)=>a-b),q=p=>so[Math.min(so.length-1,Math.floor(p*so.length))];
+const floor=q(.1),sig=q(.95),snr=sig-floor,peakDb=db(peak),clipPct=clip/N*100;
+if(sig<-55||peak<.003)return{silent:true,score:0,floor,sig,snr:0,peakDb,clipPct:0,rt:null,hum:null,bands:{low:0,mid:0,high:0},tiles:[],findings:[{l:'bad',t:'No usable signal detected. Check that the right microphone is selected and unmuted, then speak close to it.'}],grade:'No signal'};
+// reverb: time to fall 10 dB after loud frames (RT60 ~ 6 x T10)
+const t10=[];for(let i=3;i<fr.length-3;i+=1){let lm=true;for(let k=-3;k<=3;k++)if(fr[i+k]>fr[i])lm=false;
+if(!lm||fr[i]<sig-6||fr[i]-10<floor+3)continue;let j=i+1,mn=fr[i];while(j<fr.length&&j-i<90){if(fr[j]<mn)mn=fr[j];if(fr[j]>mn+4)break;if(fr[j]<=fr[i]-10){t10.push((j-i)*.01);break;}j++;}}
+t10.sort((a,b)=>a-b);const rt=t10.length>=2?t10[t10.length>>1]*6:null;
+// spectrum
+const NF=8192,fb=sr/NF,H=NF/2,w=new Float32Array(NF);for(let i=0;i<NF;i++)w[i]=.5-.5*Math.cos(2*Math.PI*i/(NF-1));
+const st=[],en=[];for(let i=0;i+NF<=N;i+=NF/2){st.push(i);let s=0;for(let k=i;k<i+NF;k+=8)s+=x[k]*x[k];en.push(s);}
+const Pa=new Float64Array(H),Pq=new Float64Array(H);let nq=0;
+if(st.length){const med=[...en].sort((a,b)=>a-b)[en.length>>1];
+for(let f=0;f<st.length;f++){const re=new Float64Array(NF),im=new Float64Array(NF);for(let k=0;k<NF;k++)re[k]=x[st[f]+k]*w[k];fft(re,im);
+const quiet=en[f]<=med;if(quiet)nq++;for(let k=0;k<H;k++){const p=re[k]*re[k]+im[k]*im[k];Pa[k]+=p;if(quiet)Pq[k]+=p;}}}
+const band=(P,a,b)=>{let s=0;for(let k=Math.max(1,Math.round(a/fb));k<=Math.min(H-1,Math.round(b/fb));k++)s+=P[k];return Math.max(s,1e-20);};
+const hi=Math.min(12000,sr/2*.95),mid=band(Pa,250,4000);
+const bands={low:10*Math.log10(band(Pa,80,250)/mid),mid:0,high:10*Math.log10(band(Pa,4000,hi)/mid)};
+const rumble=10*Math.log10(band(Pa,20,80)/mid);
+const med=(a)=>{a=[...a].sort((p,r)=>p-r);return a[a.length>>1]||1e-20;};
+const humAt=(f)=>{const P=nq?Pq:Pa,k0=Math.round(f/fb);let pk=0;for(let k=k0-1;k<=k0+1;k++)pk=Math.max(pk,P[k]||0);const nb=[];
+for(let o=8;o<=20;o+=fb)nb.push(P[Math.round((f-o)/fb)]||0,P[Math.round((f+o)/fb)]||0);return 10*Math.log10(Math.max(pk,1e-20)/Math.max(med(nb),1e-20));};
+let hum=null;if(st.length){for(const f of[50,60]){const r1=humAt(f),r2=humAt(2*f);if((r1>12||(r1>8&&r2>8))&&(!hum||r1>hum.r))hum={f,r:r1};}}
+// score
+const F=[];let score=100;const add=(l,t,p)=>{F.push({l,t});score-=p;};
+if(peak<.1)add('warn','Recording level is low (peak '+peakDb.toFixed(0)+' dBFS). Move closer to the mic or raise input gain.',8);
+if(floor>-35)add('bad','Noise floor is high ('+floor.toFixed(0)+' dBFS). Fans, traffic or a noisy device is contaminating the recording.',12);
+else if(floor>-45)add('warn','Noticeable background noise ('+floor.toFixed(0)+' dBFS).',7);
+if(snr<12)add('bad','Voice barely rises above the noise (SNR '+snr.toFixed(0)+' dB).',20);
+else if(snr<20)add('warn','Moderate signal-to-noise ratio ('+snr.toFixed(0)+' dB). Aim for 30 dB or more.',12);
+else if(snr<30)add('warn','Decent SNR ('+snr.toFixed(0)+' dB), a quieter room would make it pro-grade.',4);
+if(clip>=3&&clipPct>1)add('bad','Heavy clipping: '+clipPct.toFixed(2)+'% of samples hit the ceiling. Lower input gain.',25);
+else if(clip>=3&&clipPct>.1)add('bad','Clipping detected ('+clipPct.toFixed(2)+'%). Lower the mic gain or speak slightly off-axis.',14);
+else if(clip>=3)add('warn','Brief clipping on peaks ('+clip+' samples). Leave more headroom.',6);
+if(hum)add('bad','Electrical hum at '+hum.f+' Hz (and harmonics), usually from mains, a bad cable or ground loop. The enhancer adds a notch for it.',12);
+if(rumble>-12)add('warn','Low-frequency rumble below 80 Hz (AC, traffic or desk bumps). A high-pass filter helps.',6);
+if(rt!=null&&rt>.9)add('bad','Strong room echo, estimated RT60 about '+rt.toFixed(1)+' s. Add soft furnishings or move closer to the mic.',15);
+else if(rt!=null&&rt>.6)add('warn','Some room reverb (RT60 about '+rt.toFixed(1)+' s).',9);
+if(bands.low>0)add('warn','Boomy low-mids ('+bands.low.toFixed(0)+' dB vs mids). Proximity effect or small untreated room.',6);
+if(bands.high<-35)add('warn','Muffled highs ('+bands.high.toFixed(0)+' dB). Face the mic and avoid covering it.',6);
+else if(bands.high>-14)add('warn','Bright or hissy highs ('+bands.high.toFixed(0)+' dB). Watch sibilance and mic hiss.',5);
+if(!F.length)F.push({l:'ok',t:'Clean capture: low noise, no clipping, balanced spectrum.'});
+score=Math.max(0,Math.min(100,Math.round(score)));
+const s=(v,a,b)=>v?(v>b?'bad':v>a?'warn':'ok'):'ok';
+const tiles=[{k:'Noise floor',v:floor.toFixed(0)+' dBFS',s:floor>-35?'bad':floor>-45?'warn':'ok'},{k:'SNR',v:snr.toFixed(0)+' dB',s:snr<12?'bad':snr<25?'warn':'ok'},
+{k:'Clipping',v:clipPct.toFixed(2)+'%',s:clip<3?'ok':clipPct>.1?'bad':'warn'},{k:'Echo (RT60)',v:rt==null?'n/a':rt.toFixed(1)+' s',s:rt==null?'ok':rt>.9?'bad':rt>.6?'warn':'ok'},
+{k:'Mains hum',v:hum?hum.f+' Hz':'None',s:hum?'bad':'ok'},{k:'Peak',v:peakDb.toFixed(1)+' dBFS',s:peak<.1?'warn':'ok'}];
+return{score,floor,sig,snr,peakDb,clip,clipPct,rt,hum,bands,tiles,findings:F,grade:score>=85?'Excellent':score>=70?'Good':score>=50?'Fair':'Poor'};}
+// ==/DSP==
+
+const{useState,useRef,useEffect}=React;const html=htm.bind(React.createElement);
+const Icon=({n,s=18,c=''})=>{const ic=window.lucide&&lucide.icons&&lucide.icons[n];const nd=Array.isArray(ic)&&Array.isArray(ic[2])?ic[2]:[];return React.createElement('svg',{width:s,height:s,viewBox:'0 0 24 24',fill:'none',stroke:'currentColor',strokeWidth:2,strokeLinecap:'round',strokeLinejoin:'round',className:c,'aria-hidden':true},nd.map(([t,a],i)=>React.createElement(t,{...a,key:i})));};
+const CY='#22d3ee',AM='#fbbf24',RO='#fb7185';
+const scol=s=>s>=80?CY:s>=55?AM:RO;
+const lcol={ok:CY,warn:AM,bad:RO};
+
+function Visualizer({getAn}){
+const ref=useRef(null);
+useEffect(()=>{const cv=ref.current,ctx=cv.getContext('2d'),sp=document.createElement('canvas'),sc=sp.getContext('2d');let raf,W=1,H=1,d=1,wH=1,sH=1;
+const rs=()=>{d=Math.min(window.devicePixelRatio||1,2);const r=cv.getBoundingClientRect();cv.width=Math.max(1,r.width*d);cv.height=Math.max(1,r.height*d);W=cv.width;H=cv.height;wH=Math.floor(H*.45);sH=H-wH;sp.width=W;sp.height=sH;};
+rs();const ro=new ResizeObserver(rs);ro.observe(cv);
+const colr=t=>{t=Math.max(0,Math.min(1,t));if(t<.55){const u=t/.55;return`rgb(${7+27*u|0},${9+202*u|0},${13+225*u|0})`;}const u=(t-.55)/.45;return`rgb(${34+217*u|0},${211-20*u|0},${238-202*u|0})`;};
+const draw=()=>{raf=requestAnimationFrame(draw);const an=getAn();const now=performance.now()/1000;
+const tb=an?new Uint8Array(an.fftSize):null,fq=an?new Uint8Array(an.frequencyBinCount):null;if(an){an.getByteTimeDomainData(tb);an.getByteFrequencyData(fq);}
+const col=Math.max(1,Math.round(2*d));sc.drawImage(sp,-col,0);sc.fillStyle='#07090d';sc.fillRect(W-col,0,col,sH);
+if(fq){const nyq=an.context.sampleRate/2,f0=60,f1=Math.min(16000,nyq*.98),rows=Math.floor(sH/(2*d));for(let r=0;r<rows;r++){const f=f0*Math.pow(f1/f0,r/rows),b=Math.min(fq.length-1,Math.round(f/nyq*fq.length));sc.fillStyle=colr(fq[b]/255*1.15);sc.fillRect(W-col,sH-(r+1)*2*d,col,2*d);}}
+ctx.fillStyle='#07090d';ctx.fillRect(0,0,W,H);ctx.drawImage(sp,0,wH);
+ctx.strokeStyle='#14202a';ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(0,wH/2);ctx.lineTo(W,wH/2);ctx.moveTo(0,wH);ctx.lineTo(W,wH);ctx.stroke();
+ctx.strokeStyle=CY;ctx.lineWidth=1.6*d;ctx.shadowColor=CY;ctx.shadowBlur=10*d;ctx.beginPath();
+const n=tb?tb.length:200;for(let i=0;i<n;i++){const x=i/(n-1)*W;const v=tb?(tb[i]-128)/128:Math.sin(i*.07+now*2)*.02;const y=wH/2+v*wH*.46;i?ctx.lineTo(x,y):ctx.moveTo(x,y);}ctx.stroke();ctx.shadowBlur=0;};
+draw();return()=>{cancelAnimationFrame(raf);ro.disconnect();};},[]);
+const marks=[[100,'100 Hz'],[1000,'1 kHz'],[10000,'10 kHz']];
+return html`<div className="relative h-72 sm:h-80 rounded-xl overflow-hidden border border-[#17212b]"><canvas ref=${ref} className="w-full h-full block"/>
+<span className="absolute left-3 top-2 text-[10px] tracking-widest text-cyan-300/70">WAVEFORM</span>
+<span className="absolute left-3 text-[10px] tracking-widest text-amber-300/70" style=${{top:'47%'}}>SPECTROGRAM</span>
+${marks.map(([f,l])=>html`<span key=${f} className="absolute right-2 text-[10px] text-slate-400/80" style=${{bottom:`calc(55% * ${Math.log(f/60)/Math.log(16000/60)} - 6px)`}}>${l}</span>`)}</div>`;}
+
+function Ring({score,label,sub}){const c=scol(score),R=52,L=2*Math.PI*R;
+return html`<div className="flex flex-col items-center"><svg width="140" height="140" viewBox="0 0 140 140"><circle cx="70" cy="70" r=${R} stroke="#16212b" strokeWidth="9" fill="none"/>
+<circle cx="70" cy="70" r=${R} stroke=${c} strokeWidth="9" fill="none" strokeLinecap="round" strokeDasharray=${L} strokeDashoffset=${L*(1-score/100)} transform="rotate(-90 70 70)" style=${{filter:`drop-shadow(0 0 6px ${c})`,transition:'stroke-dashoffset .8s'}}/>
+<text x="70" y="76" textAnchor="middle" fontSize="34" fontWeight="700" fill=${c}>${score}</text></svg>
+<div className="text-xs tracking-widest text-slate-400 -mt-1">${label}</div><div className="text-sm font-medium" style=${{color:c}}>${sub}</div></div>`;}
+
+function App(){
+const[status,setStatus]=useState('idle'),[prog,setProg]=useState(0),[err,setErr]=useState(''),[res,setRes]=useState(null),[after,setAfter]=useState(null),[playing,setPlaying]=useState(null),[busyEnh,setBusyEnh]=useState(false),[mode,setMode]=useState('');
+const R=useRef({}).current;
+const getAn=()=>R.an||null;
+const engine=async()=>{if(!R.ctx||R.ctx.state==='closed'){const AC=window.AudioContext||window.webkitAudioContext;if(!AC)throw new Error('nosupport');const c=new AC();const an=c.createAnalyser();an.fftSize=2048;an.smoothingTimeConstant=.65;an.minDecibels=-90;an.maxDecibels=-10;
+const lim=c.createDynamicsCompressor();lim.threshold.value=-6;lim.knee.value=0;lim.ratio.value=20;lim.attack.value=.003;lim.release.value=.1;const g=c.createGain();g.gain.value=0;an.connect(lim);lim.connect(g);g.connect(c.destination);R.ctx=c;R.an=an;R.out=g;}
+if(R.ctx.state==='suspended')await R.ctx.resume();return R.ctx;};
+const stopPlay=()=>{const s=R.src;if(s){s.onended=null;try{s.stop();}catch(e){}try{s.disconnect();}catch(e){}R.src=null;}if(R.out&&R.ctx)R.out.gain.setTargetAtTime(0,R.ctx.currentTime,.02);setPlaying(null);};
+const stopCapture=()=>{clearInterval(R.tm);clearTimeout(R.to);if(R.cleanup){try{R.cleanup();}catch(e){}R.cleanup=null;}};
+useEffect(()=>()=>{stopCapture();stopPlay();if(R.ctx&&R.ctx.state!=='closed')R.ctx.close().catch(()=>{});},[]);
+
+const start=async m=>{if(status!=='idle')return;setErr('');setRes(null);setAfter(null);stopPlay();R.orig=R.enh=null;setMode(m);
+let ctx;try{ctx=await engine();}catch(e){setErr('Web Audio is not supported in this browser.');return;}
+const chunks=[];
+try{R.out.gain.value=0;
+if(m==='mic'){if(!window.isSecureContext||!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia)throw{name:'Unsupported'};
+const stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false,channelCount:1}});
+const src=ctx.createMediaStreamSource(stream),pr=ctx.createScriptProcessor(4096,1,1);pr.onaudioprocess=e=>{chunks.push(new Float32Array(e.inputBuffer.getChannelData(0)));};
+src.connect(R.an);src.connect(pr);pr.connect(ctx.destination);
+R.cleanup=()=>{pr.onaudioprocess=null;try{src.disconnect();pr.disconnect();}catch(e){}stream.getTracks().forEach(t=>t.stop());};}
+else{const x=synthDemo(ctx.sampleRate),b=ctx.createBuffer(1,x.length,ctx.sampleRate);b.copyToChannel(x,0);const s=ctx.createBufferSource();s.buffer=b;s.connect(R.an);s.start();chunks.push(x);
+R.cleanup=()=>{try{s.stop();}catch(e){}try{s.disconnect();}catch(e){}};}}
+catch(e){stopCapture();const n=e&&e.name;setErr(n==='NotAllowedError'||n==='SecurityError'?'Microphone access was blocked. Allow it in your browser or site settings, or run the demo instead.':n==='NotFoundError'?'No microphone was found on this device. You can still try the demo.':n==='NotReadableError'?'The microphone is busy in another app. Close it and retry, or run the demo.':n==='Unsupported'||!n?'Microphone capture needs HTTPS and a supported browser. Try the demo instead.':'Could not start recording ('+n+'). Try the demo instead.');setMode('');return;}
+setStatus('recording');setProg(0);const t0=Date.now(),sr=ctx.sampleRate;
+R.tm=setInterval(()=>setProg(Math.min(1,(Date.now()-t0)/5000)),80);
+R.to=setTimeout(()=>{stopCapture();setStatus('analyzing');
+setTimeout(()=>{try{let len=0;chunks.forEach(c=>len+=c.length);len=Math.min(len,Math.round(sr*5));const x=new Float32Array(len);let o=0;for(const c of chunks){if(o>=len)break;const n=Math.min(c.length,len-o);x.set(c.subarray(0,n),o);o+=n;}
+if(len<sr)throw new Error('short');const b=ctx.createBuffer(1,len,sr);b.copyToChannel(x,0);R.orig=b;setRes(analyze(x,sr));}
+catch(e){setErr('Recording was too short or analysis failed. Please try again.');}setStatus('idle');setProg(0);},60);},5000);};
+const cancel=()=>{stopCapture();setStatus('idle');setProg(0);setMode('');};
+
+const enhance=async()=>{if(!R.orig||busyEnh)return;setBusyEnh(true);setErr('');
+try{const b=R.orig,sr=b.sampleRate,off=new OfflineAudioContext(1,b.length,sr),s=off.createBufferSource();s.buffer=b;let node=s;
+const link=n=>{node.connect(n);node=n;};
+const hp=off.createBiquadFilter();hp.type='highpass';hp.frequency.value=80;hp.Q.value=.707;link(hp);
+if(res.hum){for(const m of[1,2,3]){const f=res.hum.f*m;if(f<sr/2*.9){const nt=off.createBiquadFilter();nt.type='notch';nt.frequency.value=f;nt.Q.value=25;link(nt);}}}
+const lp=off.createBiquadFilter();lp.type='lowpass';lp.frequency.value=Math.min(12000,sr*.45);lp.Q.value=.707;link(lp);node.connect(off.destination);s.start();
+const out=(await off.startRendering()).getChannelData(0).slice();let pk=0;for(let i=0;i<out.length;i++)pk=Math.max(pk,Math.abs(out[i]));if(pk>0){const g=.89/pk;for(let i=0;i<out.length;i++)out[i]*=g;}
+const nb=R.ctx.createBuffer(1,out.length,sr);nb.copyToChannel(out,0);R.enh=nb;setAfter(analyze(out,sr,res.clip));}
+catch(e){setErr('Enhancement failed in this browser.');}setBusyEnh(false);};
+
+const play=w=>{const b=w==='orig'?R.orig:R.enh;if(!b||!R.ctx)return;stopPlay();const s=R.ctx.createBufferSource();s.buffer=b;s.connect(R.an);R.out.gain.setTargetAtTime(.7,R.ctx.currentTime,.02);
+s.onended=()=>{if(R.src===s){R.src=null;R.out.gain.setTargetAtTime(0,R.ctx.currentTime,.02);setPlaying(null);}};s.start();R.src=s;setPlaying(w);};
+
+const busy=status!=='idle';
+return html`<div className="max-w-5xl mx-auto px-4 py-6 space-y-5">
+<header className="flex flex-wrap items-center justify-between gap-3"><div className="flex items-center gap-3"><div className="p-2 rounded-xl bg-cyan-400/10 text-cyan-300 glow"><${Icon} n="Activity" s=${24}/></div>
+<div><h1 className="text-2xl font-bold tracking-tight">Audio<span className="text-cyan-300">Audit</span></h1><p className="text-xs text-slate-400">Mic and room acoustics analyzer for interviews</p></div></div>
+<div className="flex items-center gap-2 text-xs text-emerald-300/90 border border-emerald-400/20 rounded-full px-3 py-1.5 bg-emerald-400/5"><${Icon} n="ShieldCheck" s=${14}/>100% on-device. No upload, no network.</div></header>
+
+<section className="card p-4 glow space-y-4"><${Visualizer} getAn=${getAn}/>
+<div className="flex flex-wrap items-center gap-3">
+${status==='recording'?html`<button onClick=${cancel} className="flex items-center gap-2 px-5 py-3 rounded-xl bg-rose-500/15 text-rose-300 border border-rose-400/30 font-semibold"><${Icon} n="Square" s=${16}/>Cancel</button>`
+:html`<button disabled=${busy} onClick=${()=>start('mic')} className="flex items-center gap-2 px-5 py-3 rounded-xl bg-cyan-400 text-slate-900 font-semibold hover:bg-cyan-300 transition"><${Icon} n="Mic" s=${18}/>Record 5-second test</button>`}
+<button disabled=${busy} onClick=${()=>start('demo')} className="flex items-center gap-2 px-4 py-3 rounded-xl border border-amber-300/40 text-amber-300 hover:bg-amber-300/10 transition"><${Icon} n="FlaskConical" s=${18}/>Demo mode (no mic)</button>
+<div className="flex-1 min-w-[180px]">${status==='recording'?html`<div><div className="flex justify-between text-xs text-slate-400 mb-1"><span>${mode==='demo'?'Analyzing sample room...':'Recording, speak naturally...'}</span><span>${(prog*5).toFixed(1)} / 5.0 s</span></div>
+<div className="h-1.5 rounded bg-[#16212b] overflow-hidden"><div className="h-full" style=${{width:prog*100+'%',background:`linear-gradient(90deg,${CY},${AM})`}}/></div></div>`
+:status==='analyzing'?html`<span className="text-sm text-amber-300">Analyzing...</span>`:html`<span className="text-xs text-slate-500">Tip: stay at your normal distance and read a few sentences aloud.</span>`}</div></div>
+${err&&html`<div role="alert" className="flex gap-2 items-start text-sm text-amber-200 bg-amber-400/10 border border-amber-300/30 rounded-lg p-3"><${Icon} n="AlertTriangle" s=${18} c="shrink-0 mt-0.5"/><span>${err}</span></div>`}
+</section>
+
+${res&&html`<section className="card p-5 space-y-5"><div className="flex flex-wrap gap-6 items-center">
+<${Ring} score=${res.score} label="QUALITY SCORE" sub=${res.grade}/>
+<div className="flex-1 min-w-[260px] grid grid-cols-2 sm:grid-cols-3 gap-2">${res.tiles.map(t=>html`<div key=${t.k} className="rounded-lg border border-[#17212b] bg-[#0b1016] p-3"><div className="flex items-center gap-1.5 text-[11px] text-slate-400"><span className="w-1.5 h-1.5 rounded-full" style=${{background:lcol[t.s]}}/>${t.k}</div><div className="text-base font-semibold mt-0.5">${t.v}</div></div>`)}</div></div>
+${!res.silent&&html`<div><div className="text-xs tracking-widest text-slate-400 mb-2">FREQUENCY BALANCE (relative to mids)</div><div className="space-y-1.5">
+${[['Low 80-250 Hz',res.bands.low],['Mid 250-4k Hz',0],['High 4k-12k Hz',res.bands.high]].map(([n,v])=>html`<div key=${n} className="flex items-center gap-3 text-xs"><span className="w-28 text-slate-400">${n}</span>
+<div className="flex-1 h-2 rounded bg-[#16212b] overflow-hidden"><div className="h-full rounded" style=${{width:Math.max(3,Math.min(100,(v+45)/50*100))+'%',background:n.startsWith('Mid')?CY:AM}}/></div><span className="w-14 text-right text-slate-300">${v>0?'+':''}${v.toFixed(0)} dB</span></div>`)}</div></div>`}
+<div><div className="text-xs tracking-widest text-slate-400 mb-2">DIAGNOSIS</div><ul className="space-y-2">${res.findings.map((f,i)=>html`<li key=${i} className="flex gap-2 text-sm"><${Icon} n=${f.l==='ok'?'CheckCircle2':'AlertTriangle'} s=${17} c="shrink-0 mt-0.5"/><span style=${{color:f.l==='ok'?'#a5f3fc':f.l==='warn'?'#fde68a':'#fecdd3'}}>${f.t}</span></li>`)}</ul></div></section>
+
+${!res.silent&&html`<section className="card p-5 space-y-4"><div className="flex flex-wrap items-center justify-between gap-3"><div><h2 className="font-semibold flex items-center gap-2"><${Icon} n="Sparkles" s=${18} c="text-amber-300"/>Enhance Audio</h2>
+<p className="text-xs text-slate-400 mt-1">High-pass 80 Hz, low-pass 12 kHz${res.hum?`, hum notch at ${res.hum.f} Hz`:''}, then safe normalization. Clipping cannot be repaired.</p></div>
+<button disabled=${busyEnh} onClick=${enhance} className="flex items-center gap-2 px-4 py-2.5 rounded-xl bg-amber-300 text-slate-900 font-semibold hover:bg-amber-200 transition"><${Icon} n="Sparkles" s=${16}/>${busyEnh?'Processing...':after?'Re-run':'Enhance Audio'}</button></div>
+<div className="grid sm:grid-cols-2 gap-4"><div className="rounded-xl border border-[#17212b] p-4 flex flex-col items-center gap-3"><${Ring} score=${res.score} label="BEFORE" sub="Original"/>
+<button onClick=${()=>playing==='orig'?stopPlay():play('orig')} className="flex items-center gap-2 px-4 py-2 rounded-lg border border-cyan-300/40 text-cyan-300 hover:bg-cyan-300/10"><${Icon} n=${playing==='orig'?'Square':'Play'} s=${15}/>${playing==='orig'?'Stop':'Play original'}</button></div>
+<div className="rounded-xl border border-[#17212b] p-4 flex flex-col items-center gap-3">${after?html`<${Ring} score=${after.score} label="AFTER" sub=${after.score>=res.score?'+'+(after.score-res.score)+' pts':(after.score-res.score)+' pts'}/>
+<button onClick=${()=>playing==='enh'?stopPlay():play('enh')} className="flex items-center gap-2 px-4 py-2 rounded-lg border border-amber-300/40 text-amber-300 hover:bg-amber-300/10"><${Icon} n=${playing==='enh'?'Square':'Play'} s=${15}/>${playing==='enh'?'Stop':'Play enhanced'}</button>`
+:html`<div className="h-full min-h-[190px] flex items-center text-sm text-slate-500 text-center">Press Enhance Audio to compare.</div>`}</div></div>
+<p className="text-[11px] text-slate-500 flex items-center gap-1.5"><${Icon} n="Volume2" s=${13}/>Playback runs through a limiter at moderate volume. Demo audio is synthetic.</p></section>`}`}
+<footer className="text-center text-[11px] text-slate-600 pb-4">Mic released right after recording. Audio never leaves your device. Heuristic analysis, not a lab measurement.</footer></div>`;}
+ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(App));
+</script></body></html>
